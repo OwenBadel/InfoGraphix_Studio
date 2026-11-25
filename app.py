@@ -12,13 +12,17 @@ from fastapi.staticfiles import StaticFiles
 
 from infographix.domain.models import InfografiaSpec
 from infographix.domain.presets import listar_presets, obtener_preset
+from infographix.domain.story_elena import obtener_cuento_elena
 from infographix.domain.themes import TEMAS
 from infographix.exporters.html_exporter import exportar_html
 from infographix.exporters.pptx_exporter import exportar_pptx_bytes
+from infographix.exporters.story_html_exporter import exportar_cuento_html
+from infographix.exporters.story_pptx_exporter import exportar_cuento_pptx_bytes
 
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+ASSETS_ELENA_DIR = BASE_DIR / "assets" / "cuento_elena"
 
 app = FastAPI(
     title="InfoGraphix Studio",
@@ -101,6 +105,34 @@ def api_export_pptx(spec: InfografiaSpec) -> Response:
         content=contenido,
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
         headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
+
+
+@app.get("/cuento/elena", response_class=HTMLResponse)
+def ver_cuento_elena() -> HTMLResponse:
+    """Abre en el navegador el libro-infografía interactivo de Elena."""
+    return HTMLResponse(content=exportar_cuento_html(obtener_cuento_elena(), ASSETS_ELENA_DIR))
+
+
+@app.get("/api/cuento/elena/html")
+def descargar_cuento_elena_html() -> Response:
+    """Descarga el cuento interactivo de Elena en HTML5 autocontenido."""
+    contenido = exportar_cuento_html(obtener_cuento_elena(), ASSETS_ELENA_DIR).encode("utf-8")
+    return Response(
+        content=contenido,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="La_Mujer_de_las_Mil_Pestanas_Abiertas.html"'},
+    )
+
+
+@app.get("/api/cuento/elena/pptx")
+def descargar_cuento_elena_pptx() -> Response:
+    """Descarga el cuento interactivo de Elena en PowerPoint (.pptx) ilustrado."""
+    contenido = exportar_cuento_pptx_bytes(obtener_cuento_elena(), ASSETS_ELENA_DIR)
+    return Response(
+        content=contenido,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": 'attachment; filename="La_Mujer_de_las_Mil_Pestanas_Abiertas.pptx"'},
     )
 
 
