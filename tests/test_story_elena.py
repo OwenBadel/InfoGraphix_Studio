@@ -1,4 +1,4 @@
-"""Pruebas automatizadas del libro-infografía interactivo de Elena."""
+"""Pruebas automatizadas del cuento ilustrado limpio y popups nativos de Elena."""
 
 import io
 from pathlib import Path
@@ -15,43 +15,66 @@ ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets" / "cuento_elena"
 client = TestClient(app)
 
 
-def test_cuento_elena_cumple_rubrica_palabras_y_progresion_cromatica():
+def test_cuento_elena_sin_ruido_visual_y_cumple_extension():
     cuento = obtener_cuento_elena()
     assert len(cuento.escenas) == 5
-    # Rúbrica: mínimo 800 palabras
     assert cuento.total_palabras_relato() >= 820
-    # Transición cromática real: escena 1 oscura/fría -> escena 5 clara/cálida
-    assert cuento.escenas[0].paleta.es_oscura is True
-    assert cuento.escenas[-1].paleta.es_oscura is False
-    # Progresión emocional coherente
-    assert cuento.escenas[0].nivel_carga_mental > cuento.escenas[-1].nivel_carga_mental
-    assert cuento.escenas[-1].nivel_calma > cuento.escenas[0].nivel_calma
+    assert cuento.escenas[0].etiqueta_tiempo == "5:30 a. m. · Madrugada"
+    for esc in cuento.escenas:
+        assert "Escena" not in esc.etiqueta_tiempo
+        assert "Azul Acero" not in esc.paleta.nombre_clima
 
 
-def test_cuento_html_embebe_imagenes_y_controles_interactivos():
+def test_cuento_html_limpio_con_ventana_emergente():
     cuento = obtener_cuento_elena()
     html_out = exportar_cuento_html(cuento, ASSETS_DIR)
     assert "La mujer de las mil pestañas abiertas" in html_out
     assert "data:image/jpeg;base64," in html_out
-    assert "speechSynthesis" in html_out
-    assert "Ver dato sobre salud mental" in html_out
-    assert "respiración 4–4–6" in html_out
+    assert 'role="dialog"' in html_out
+    assert "💡 Dato de salud mental" in html_out
+    # Sin elementos descartados por el usuario
+    assert "Mapa de Salud Mental" not in html_out
+    assert "medidores-escena" not in html_out
+    assert "Calma interior" not in html_out
+    assert "Extensión del relato" not in html_out
+    assert "Azul Acero" not in html_out
 
 
-def test_cuento_pptx_genera_13_slides_con_imagenes_enlaces_y_grafico():
+def test_cuento_pptx_7_diapositivas_con_popups_interactivos_en_la_misma_slide():
     cuento = obtener_cuento_elena()
     raw = exportar_cuento_pptx_bytes(cuento, ASSETS_DIR)
     prs = Presentation(io.BytesIO(raw))
 
-    # 1 Portada + 5 Escenas + 1 Reflexión + 1 Infografía + 5 Cápsulas de Salud Mental = 13 slides
-    assert len(prs.slides) == 13
-    # Portada tiene enlaces interactivos a escenas e infografía
-    enlaces_portada = sum(
-        1 for sh in prs.slides[0].shapes if getattr(getattr(sh, "click_action", None), "target_slide", None) is not None
+    # 1 Portada + 5 páginas del cuento + 1 Reflexión = 7 diapositivas limpias
+    assert len(prs.slides) == 7
+
+    # La portada solo tiene el botón Comenzar lectura (sin mapa ni 5 accesos)
+    textos_portada = " ".join(
+        sh.text_frame.text for sh in prs.slides[0].shapes if sh.has_text_frame
     )
-    assert enlaces_portada >= 7
-    # Slide 8 (índice 7) es la infografía de cierre con gráfico nativo editable
-    assert any(getattr(sh, "has_chart", False) for sh in prs.slides[7].shapes)
+    assert "Comenzar lectura" in textos_portada
+    assert "Mapa de Salud Mental" not in textos_portada
+    assert "Extensión del relato" not in textos_portada
+    assert "Modo Presentación" not in textos_portada
+
+    # Cada una de las 5 páginas tiene animación desencadenada (<p:timing> + interactiveSeq)
+    # y todos los spid referenciados en <p:spTgt> existen en la misma diapositiva
+    ns = {"p": "http://schemas.openxmlformats.org/presentationml/2006/main"}
+    for slide in list(prs.slides)[1:6]:
+        textos = " ".join(sh.text_frame.text for sh in slide.shapes if sh.has_text_frame)
+        assert "Dato de salud mental" in textos
+        assert "Carga mental:" not in textos
+        assert "Calma interior:" not in textos
+        assert "Escena 1" not in textos
+        assert "Azul Acero" not in textos
+
+        spids_presentes = {str(sh.shape_id) for sh in slide.shapes}
+        seqs = slide._element.findall(".//p:seq/p:cTn[@nodeType='interactiveSeq']", ns)
+        assert len(seqs) == 3  # Abrir popup, Cerrar con X, Cerrar tocando tarjeta
+        targets = slide._element.findall(".//p:spTgt", ns)
+        assert len(targets) >= 6
+        for t in targets:
+            assert t.get("spid") in spids_presentes
 
 
 def test_endpoints_cuento_elena_funcionan():
@@ -61,7 +84,6 @@ def test_endpoints_cuento_elena_funcionan():
 
     r_html = client.get("/api/cuento/elena/html")
     assert r_html.status_code == 200
-    assert "La_Mujer_de_las_Mil_Pestanas_Abiertas.html" in r_html.headers["content-disposition"]
 
     r_pptx = client.get("/api/cuento/elena/pptx")
     assert r_pptx.status_code == 200

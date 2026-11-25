@@ -1,4 +1,4 @@
-"""Exportador PowerPoint (.pptx) 16:9 interactivo e ilustrado para Cuentos-Infografía."""
+"""Exportador PowerPoint (.pptx) 16:9 limpio e ilustrado con popups nativos en la misma diapositiva."""
 
 from __future__ import annotations
 
@@ -6,11 +6,10 @@ import io
 from pathlib import Path
 
 from pptx import Presentation
-from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
-from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.oxml import parse_xml
 from pptx.util import Inches, Pt
 
 from ..domain.story_models import CuentoInfografiaSpec, EscenaCuento, PaletaEscena
@@ -41,14 +40,19 @@ def _rect(
     height,
     fill_rgb: RGBColor,
     border_rgb: RGBColor | None = None,
+    border_pt: float = 1.0,
     shape_type=MSO_SHAPE.ROUNDED_RECTANGLE,
+    corner_radius: float = 0.04,
 ):
     sh = slide.shapes.add_shape(shape_type, left, top, width, height)
     sh.fill.solid()
     sh.fill.fore_color.rgb = fill_rgb
+    sh.shadow.inherit = False
+    if shape_type == MSO_SHAPE.ROUNDED_RECTANGLE and len(sh.adjustments) > 0:
+        sh.adjustments[0] = corner_radius
     if border_rgb is not None:
         sh.line.color.rgb = border_rgb
-        sh.line.width = Pt(1)
+        sh.line.width = Pt(border_pt)
     else:
         sh.line.fill.background()
     sh.text_frame.word_wrap = True
@@ -98,14 +102,14 @@ def _boton(
     fill_rgb: RGBColor,
     text_rgb: RGBColor,
     border_rgb: RGBColor | None = None,
-    font_size: int = 10,
+    font_size: int = 11,
     target_slide=None,
 ):
-    sh = _rect(slide, left, top, width, height, fill_rgb, border_rgb)
+    sh = _rect(slide, left, top, width, height, fill_rgb, border_rgb, corner_radius=0.16)
     tf = sh.text_frame
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    tf.margin_left = Inches(0.08)
-    tf.margin_right = Inches(0.08)
+    tf.margin_left = Inches(0.1)
+    tf.margin_right = Inches(0.1)
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
     r = p.add_run()
@@ -119,65 +123,309 @@ def _boton(
     return sh
 
 
-def _barra_navegacion_libro(
+def _agregar_navegacion_simple(
     slide,
     pal: PaletaEscena,
-    slide_portada,
-    slides_escenas: list,
-    slide_reflexion,
-    slide_infografia,
-    activa: str,
+    slide_anterior=None,
+    slide_siguiente=None,
+    texto_anterior: str = "← Regresar",
+    texto_siguiente: str = "Siguiente →",
 ) -> None:
-    """Barra inferior interactiva de navegación no lineal (Modo Presentación F5)."""
-    _rect(
-        slide,
-        Inches(0),
-        Inches(6.82),
-        SLIDE_W,
-        Inches(0.68),
-        _rgb(pal, pal.surface),
-        _rgb(pal, pal.border),
-        shape_type=MSO_SHAPE.RECTANGLE,
-    )
-
-    items: list[tuple[str, str, object]] = [("portada", "Portada", slide_portada)]
-    for idx, sl in enumerate(slides_escenas, start=1):
-        items.append((f"esc-{idx}", f"Escena {idx}", sl))
-    items.append(("reflexion", "Reflexión", slide_reflexion))
-    items.append(("infografia", "Mapa Salud", slide_infografia))
-
-    x = Inches(0.45)
-    for clave, label, destino in items:
-        es_act = clave == activa
-        ancho = Inches(1.42 if clave in ("portada", "reflexion", "infografia") else 1.24)
+    """Agrega únicamente los botones de Regresar y Siguiente, sin barras ni pestañas."""
+    if slide_anterior is not None:
         _boton(
             slide,
-            x,
-            Inches(6.95),
-            ancho,
-            Inches(0.4),
-            label,
-            _rgb(pal, pal.accent if es_act else pal.surface_alt),
-            _rgb(pal, pal.accent_ink if es_act else pal.ink),
-            _rgb(pal, pal.accent if es_act else pal.border),
-            font_size=10,
-            target_slide=None if es_act else destino,
+            Inches(0.6),
+            Inches(6.72),
+            Inches(1.85),
+            Inches(0.46),
+            texto_anterior,
+            _rgb(pal, pal.surface),
+            _rgb(pal, pal.ink),
+            _rgb(pal, pal.border),
+            font_size=11,
+            target_slide=slide_anterior,
         )
-        x += ancho + Inches(0.14)
+
+    if slide_siguiente is not None:
+        _boton(
+            slide,
+            Inches(10.88),
+            Inches(6.72),
+            Inches(1.85),
+            Inches(0.46),
+            texto_siguiente,
+            _rgb(pal, pal.accent),
+            _rgb(pal, pal.accent_ink),
+            font_size=11,
+            target_slide=slide_siguiente,
+        )
+
+
+def _inyectar_popup_trigger_xml(
+    slide,
+    open_btn_id: int,
+    popup_card_id: int,
+    close_btn_id: int,
+) -> None:
+    """Inyecta animaciones desencadenadas OpenXML (<p:timing>) 100% nativas de Microsoft PowerPoint.
+
+    - Al iniciar la diapositiva, la ventana emergente y su botón '✕' permanecen ocultos.
+    - Clic en '💡 Dato de salud mental' (open_btn_id): aparece la ventana emergente (grpId=0).
+    - Clic en '✕' (close_btn_id) o sobre la tarjeta emergente (popup_card_id): se oculta (grpId=1 / grpId=2).
+    """
+    timing_xml = f"""
+    <p:timing xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+      <p:tnLst>
+        <p:par>
+          <p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot">
+            <p:childTnLst>
+              <p:seq concurrent="1" nextAc="seek">
+                <p:cTn id="2" restart="whenNotActive" fill="hold" evtFilter="cancelBubble" nodeType="interactiveSeq">
+                  <p:stCondLst>
+                    <p:cond evt="onClick" delay="0">
+                      <p:tgtEl><p:spTgt spid="{open_btn_id}"/></p:tgtEl>
+                    </p:cond>
+                  </p:stCondLst>
+                  <p:endSync evt="end" delay="0"><p:rtn val="all"/></p:endSync>
+                  <p:childTnLst>
+                    <p:par>
+                      <p:cTn id="3" fill="hold">
+                        <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                        <p:childTnLst>
+                          <p:par>
+                            <p:cTn id="4" fill="hold">
+                              <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                              <p:childTnLst>
+                                <p:par>
+                                  <p:cTn id="5" presetID="10" presetClass="entr" presetSubtype="0" fill="hold" grpId="0" nodeType="clickEffect">
+                                    <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                                    <p:childTnLst>
+                                      <p:set>
+                                        <p:cBhvr>
+                                          <p:cTn id="6" dur="1" fill="hold"><p:stCondLst><p:cond delay="0"/></p:stCondLst></p:cTn>
+                                          <p:tgtEl><p:spTgt spid="{popup_card_id}"/></p:tgtEl>
+                                          <p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst>
+                                        </p:cBhvr>
+                                        <p:to><p:strVal val="visible"/></p:to>
+                                      </p:set>
+                                      <p:animEffect transition="in" filter="fade">
+                                        <p:cBhvr>
+                                          <p:cTn id="7" dur="300"/>
+                                          <p:tgtEl><p:spTgt spid="{popup_card_id}"/></p:tgtEl>
+                                        </p:cBhvr>
+                                      </p:animEffect>
+                                    </p:childTnLst>
+                                  </p:cTn>
+                                </p:par>
+                                <p:par>
+                                  <p:cTn id="8" presetID="10" presetClass="entr" presetSubtype="0" fill="hold" grpId="0" nodeType="withEffect">
+                                    <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                                    <p:childTnLst>
+                                      <p:set>
+                                        <p:cBhvr>
+                                          <p:cTn id="9" dur="1" fill="hold"><p:stCondLst><p:cond delay="0"/></p:stCondLst></p:cTn>
+                                          <p:tgtEl><p:spTgt spid="{close_btn_id}"/></p:tgtEl>
+                                          <p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst>
+                                        </p:cBhvr>
+                                        <p:to><p:strVal val="visible"/></p:to>
+                                      </p:set>
+                                      <p:animEffect transition="in" filter="fade">
+                                        <p:cBhvr>
+                                          <p:cTn id="10" dur="300"/>
+                                          <p:tgtEl><p:spTgt spid="{close_btn_id}"/></p:tgtEl>
+                                        </p:cBhvr>
+                                      </p:animEffect>
+                                    </p:childTnLst>
+                                  </p:cTn>
+                                </p:par>
+                              </p:childTnLst>
+                            </p:cTn>
+                          </p:par>
+                        </p:childTnLst>
+                      </p:cTn>
+                    </p:par>
+                  </p:childTnLst>
+                </p:cTn>
+                <p:nextCondLst>
+                  <p:cond evt="onClick" delay="0">
+                    <p:tgtEl><p:spTgt spid="{open_btn_id}"/></p:tgtEl>
+                  </p:cond>
+                </p:nextCondLst>
+              </p:seq>
+              <p:seq concurrent="1" nextAc="seek">
+                <p:cTn id="11" restart="whenNotActive" fill="hold" evtFilter="cancelBubble" nodeType="interactiveSeq">
+                  <p:stCondLst>
+                    <p:cond evt="onClick" delay="0">
+                      <p:tgtEl><p:spTgt spid="{close_btn_id}"/></p:tgtEl>
+                    </p:cond>
+                  </p:stCondLst>
+                  <p:endSync evt="end" delay="0"><p:rtn val="all"/></p:endSync>
+                  <p:childTnLst>
+                    <p:par>
+                      <p:cTn id="12" fill="hold">
+                        <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                        <p:childTnLst>
+                          <p:par>
+                            <p:cTn id="13" fill="hold">
+                              <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                              <p:childTnLst>
+                                <p:par>
+                                  <p:cTn id="14" presetID="10" presetClass="exit" presetSubtype="0" fill="hold" grpId="1" nodeType="clickEffect">
+                                    <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                                    <p:childTnLst>
+                                      <p:animEffect transition="out" filter="fade">
+                                        <p:cBhvr>
+                                          <p:cTn id="15" dur="220"/>
+                                          <p:tgtEl><p:spTgt spid="{popup_card_id}"/></p:tgtEl>
+                                        </p:cBhvr>
+                                      </p:animEffect>
+                                      <p:set>
+                                        <p:cBhvr>
+                                          <p:cTn id="16" dur="1" fill="hold"><p:stCondLst><p:cond delay="219"/></p:stCondLst></p:cTn>
+                                          <p:tgtEl><p:spTgt spid="{popup_card_id}"/></p:tgtEl>
+                                          <p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst>
+                                        </p:cBhvr>
+                                        <p:to><p:strVal val="hidden"/></p:to>
+                                      </p:set>
+                                    </p:childTnLst>
+                                  </p:cTn>
+                                </p:par>
+                                <p:par>
+                                  <p:cTn id="17" presetID="10" presetClass="exit" presetSubtype="0" fill="hold" grpId="1" nodeType="withEffect">
+                                    <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                                    <p:childTnLst>
+                                      <p:animEffect transition="out" filter="fade">
+                                        <p:cBhvr>
+                                          <p:cTn id="18" dur="220"/>
+                                          <p:tgtEl><p:spTgt spid="{close_btn_id}"/></p:tgtEl>
+                                        </p:cBhvr>
+                                      </p:animEffect>
+                                      <p:set>
+                                        <p:cBhvr>
+                                          <p:cTn id="19" dur="1" fill="hold"><p:stCondLst><p:cond delay="219"/></p:stCondLst></p:cTn>
+                                          <p:tgtEl><p:spTgt spid="{close_btn_id}"/></p:tgtEl>
+                                          <p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst>
+                                        </p:cBhvr>
+                                        <p:to><p:strVal val="hidden"/></p:to>
+                                      </p:set>
+                                    </p:childTnLst>
+                                  </p:cTn>
+                                </p:par>
+                              </p:childTnLst>
+                            </p:cTn>
+                          </p:par>
+                        </p:childTnLst>
+                      </p:cTn>
+                    </p:par>
+                  </p:childTnLst>
+                </p:cTn>
+                <p:nextCondLst>
+                  <p:cond evt="onClick" delay="0">
+                    <p:tgtEl><p:spTgt spid="{close_btn_id}"/></p:tgtEl>
+                  </p:cond>
+                </p:nextCondLst>
+              </p:seq>
+              <p:seq concurrent="1" nextAc="seek">
+                <p:cTn id="20" restart="whenNotActive" fill="hold" evtFilter="cancelBubble" nodeType="interactiveSeq">
+                  <p:stCondLst>
+                    <p:cond evt="onClick" delay="0">
+                      <p:tgtEl><p:spTgt spid="{popup_card_id}"/></p:tgtEl>
+                    </p:cond>
+                  </p:stCondLst>
+                  <p:endSync evt="end" delay="0"><p:rtn val="all"/></p:endSync>
+                  <p:childTnLst>
+                    <p:par>
+                      <p:cTn id="21" fill="hold">
+                        <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                        <p:childTnLst>
+                          <p:par>
+                            <p:cTn id="22" fill="hold">
+                              <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                              <p:childTnLst>
+                                <p:par>
+                                  <p:cTn id="23" presetID="10" presetClass="exit" presetSubtype="0" fill="hold" grpId="2" nodeType="clickEffect">
+                                    <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                                    <p:childTnLst>
+                                      <p:animEffect transition="out" filter="fade">
+                                        <p:cBhvr>
+                                          <p:cTn id="24" dur="220"/>
+                                          <p:tgtEl><p:spTgt spid="{popup_card_id}"/></p:tgtEl>
+                                        </p:cBhvr>
+                                      </p:animEffect>
+                                      <p:set>
+                                        <p:cBhvr>
+                                          <p:cTn id="25" dur="1" fill="hold"><p:stCondLst><p:cond delay="219"/></p:stCondLst></p:cTn>
+                                          <p:tgtEl><p:spTgt spid="{popup_card_id}"/></p:tgtEl>
+                                          <p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst>
+                                        </p:cBhvr>
+                                        <p:to><p:strVal val="hidden"/></p:to>
+                                      </p:set>
+                                    </p:childTnLst>
+                                  </p:cTn>
+                                </p:par>
+                                <p:par>
+                                  <p:cTn id="26" presetID="10" presetClass="exit" presetSubtype="0" fill="hold" grpId="2" nodeType="withEffect">
+                                    <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+                                    <p:childTnLst>
+                                      <p:animEffect transition="out" filter="fade">
+                                        <p:cBhvr>
+                                          <p:cTn id="27" dur="220"/>
+                                          <p:tgtEl><p:spTgt spid="{close_btn_id}"/></p:tgtEl>
+                                        </p:cBhvr>
+                                      </p:animEffect>
+                                      <p:set>
+                                        <p:cBhvr>
+                                          <p:cTn id="28" dur="1" fill="hold"><p:stCondLst><p:cond delay="219"/></p:stCondLst></p:cTn>
+                                          <p:tgtEl><p:spTgt spid="{close_btn_id}"/></p:tgtEl>
+                                          <p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst>
+                                        </p:cBhvr>
+                                        <p:to><p:strVal val="hidden"/></p:to>
+                                      </p:set>
+                                    </p:childTnLst>
+                                  </p:cTn>
+                                </p:par>
+                              </p:childTnLst>
+                            </p:cTn>
+                          </p:par>
+                        </p:childTnLst>
+                      </p:cTn>
+                    </p:par>
+                  </p:childTnLst>
+                </p:cTn>
+                <p:nextCondLst>
+                  <p:cond evt="onClick" delay="0">
+                    <p:tgtEl><p:spTgt spid="{popup_card_id}"/></p:tgtEl>
+                  </p:cond>
+                </p:nextCondLst>
+              </p:seq>
+            </p:childTnLst>
+          </p:cTn>
+        </p:par>
+      </p:tnLst>
+      <p:bldLst>
+        <p:bldP spid="{popup_card_id}" grpId="0" animBg="1"/>
+        <p:bldP spid="{popup_card_id}" grpId="1" animBg="1"/>
+        <p:bldP spid="{popup_card_id}" grpId="2" animBg="1"/>
+        <p:bldP spid="{close_btn_id}" grpId="0" animBg="1"/>
+        <p:bldP spid="{close_btn_id}" grpId="1" animBg="1"/>
+        <p:bldP spid="{close_btn_id}" grpId="2" animBg="1"/>
+      </p:bldLst>
+    </p:timing>
+    """
+    slide._element.append(parse_xml(timing_xml))
 
 
 def _construir_portada(
     slide,
     spec: CuentoInfografiaSpec,
     assets_dir: Path,
-    slides_escenas: list,
-    slide_reflexion,
-    slide_infografia,
+    primera_pagina,
 ) -> None:
     pal = spec.escenas[0].paleta
     _pintar_fondo(slide, pal)
 
-    # Franja de progresión cromática superior (5 colores frío -> cálido)
+    # Franja sutil superior mostrando la transición fría -> cálida
     ancho_franja = 13.333 / len(spec.escenas)
     for idx, esc in enumerate(spec.escenas):
         _rect(
@@ -185,462 +433,285 @@ def _construir_portada(
             Inches(idx * ancho_franja),
             Inches(0),
             Inches(ancho_franja + 0.02),
-            Inches(0.16),
+            Inches(0.1),
             _rgb(esc.paleta, esc.paleta.accent),
             shape_type=MSO_SHAPE.RECTANGLE,
         )
 
-    # Columna izquierda: identidad editorial
-    _boton(
-        slide,
-        Inches(0.6),
-        Inches(0.55),
-        Inches(4.3),
-        Inches(0.36),
-        spec.etiqueta_coleccion.upper(),
-        _rgb(pal, pal.accent_soft),
-        _rgb(pal, pal.accent),
-        font_size=9,
-    )
-
+    # Columna izquierda minimalista: solo título, subtítulo y botón Comenzar
     _texto(
         slide,
-        Inches(0.6),
-        Inches(1.08),
-        Inches(6.2),
-        Inches(1.5),
+        Inches(0.75),
+        Inches(1.55),
+        Inches(5.85),
+        Inches(1.65),
         spec.titulo,
         FONT_DISPLAY,
-        34,
+        38,
         _rgb(pal, pal.ink),
         bold=True,
     )
     _texto(
         slide,
-        Inches(0.6),
-        Inches(2.58),
-        Inches(6.1),
-        Inches(1.05),
+        Inches(0.75),
+        Inches(3.45),
+        Inches(5.65),
+        Inches(1.15),
         spec.subtitulo,
         FONT_BODY,
-        13,
+        14,
         _rgb(pal, pal.muted),
     )
-
-    # Ficha de extensión (rúbrica)
-    _texto(
-        slide,
-        Inches(0.6),
-        Inches(3.75),
-        Inches(6.1),
-        Inches(0.35),
-        f"Extensión del relato: {spec.total_palabras_relato()} palabras  ·  5 escenas ilustradas  ·  5 datos de salud mental",
-        FONT_BODY,
-        10,
-        _rgb(pal, pal.accent),
-        bold=True,
-    )
-
-    # Botón CTA principal
     _boton(
         slide,
-        Inches(0.6),
-        Inches(4.25),
-        Inches(2.9),
-        Inches(0.56),
+        Inches(0.75),
+        Inches(4.9),
+        Inches(2.8),
+        Inches(0.58),
         "Comenzar lectura →",
         _rgb(pal, pal.accent),
         _rgb(pal, pal.accent_ink),
         font_size=13,
-        target_slide=slides_escenas[0],
-    )
-    _boton(
-        slide,
-        Inches(3.7),
-        Inches(4.25),
-        Inches(2.7),
-        Inches(0.56),
-        "Mapa de Salud Mental",
-        _rgb(pal, pal.surface),
-        _rgb(pal, pal.ink),
-        _rgb(pal, pal.border),
-        font_size=12,
-        target_slide=slide_infografia,
+        target_slide=primera_pagina,
     )
 
-    # Mosaico ilustrativo derecha (Escena 1 arriba + Escena 5 abajo mostrando el viaje frío -> cálido)
+    # Columna derecha: dos láminas en contraste (madrugada y mañana soleada)
     img1 = assets_dir / spec.escenas[0].imagen_archivo
     img5 = assets_dir / spec.escenas[-1].imagen_archivo
     if img1.exists():
-        slide.shapes.add_picture(str(img1), Inches(7.15), Inches(0.55), width=Inches(5.55), height=Inches(3.12))
+        slide.shapes.add_picture(str(img1), Inches(6.95), Inches(0.65), width=Inches(5.7), height=Inches(3.2))
     if img5.exists():
-        slide.shapes.add_picture(str(img5), Inches(7.15), Inches(3.88), width=Inches(5.55), height=Inches(3.12))
+        slide.shapes.add_picture(str(img5), Inches(6.95), Inches(4.02), width=Inches(5.7), height=Inches(3.2))
 
-    # Accesos directos a las 5 escenas en el pie izquierdo
-    _texto(
-        slide,
-        Inches(0.6),
-        Inches(5.05),
-        Inches(6.1),
-        Inches(0.28),
-        "Explorar directamente una escena (Modo Presentación F5):",
-        FONT_BODY,
-        10,
-        _rgb(pal, pal.muted),
-        bold=True,
-    )
-    for idx, esc in enumerate(spec.escenas):
-        col = idx % 3
-        row = idx // 3
-        bx = Inches(0.6 + col * 2.08)
-        by = Inches(5.4 + row * 0.62)
-        _boton(
-            slide,
-            bx,
-            by,
-            Inches(1.96),
-            Inches(0.48),
-            f"0{esc.numero}. {esc.titulo[:18]}",
-            _rgb(esc.paleta, esc.paleta.surface),
-            _rgb(esc.paleta, esc.paleta.ink),
-            _rgb(esc.paleta, esc.paleta.accent),
-            font_size=9,
-            target_slide=slides_escenas[idx],
-        )
-
-    slide.notes_slide.notes_text_frame.text = (
-        f"Portada: {spec.titulo}. Relato ilustrado de {spec.total_palabras_relato()} palabras "
-        f"organizado en 5 escenas con transición cromática de tonos fríos a cálidos."
-    )
+    slide.notes_slide.notes_text_frame.text = f"Portada: {spec.titulo}."
 
 
-def _construir_slide_escena(
+def _construir_slide_pagina(
     slide,
     esc: EscenaCuento,
-    spec: CuentoInfografiaSpec,
     assets_dir: Path,
-    slide_portada,
-    slides_escenas: list,
-    slide_dato,
-    slide_reflexion,
-    slide_infografia,
+    slide_anterior,
+    slide_siguiente,
 ) -> None:
     pal = esc.paleta
+    dato = esc.dato_salud
     _pintar_fondo(slide, pal)
 
-    # Franja superior cromática
+    # Franja sutil superior
     _rect(
         slide,
         Inches(0),
         Inches(0),
         SLIDE_W,
-        Inches(0.12),
+        Inches(0.09),
         _rgb(pal, pal.accent),
         shape_type=MSO_SHAPE.RECTANGLE,
     )
 
-    # Cabecera izquierda-derecha
+    # Cabecera limpia: solo momento del día + título
     _texto(
         slide,
-        Inches(0.55),
+        Inches(0.6),
         Inches(0.28),
-        Inches(8.5),
+        Inches(8.4),
         Inches(0.32),
-        f"{esc.etiqueta_tiempo.upper()}   ·   {pal.nombre_clima.upper()}",
+        esc.etiqueta_tiempo,
         FONT_BODY,
-        10,
+        11,
         _rgb(pal, pal.accent),
         bold=True,
     )
     _texto(
         slide,
-        Inches(0.55),
+        Inches(0.6),
         Inches(0.58),
-        Inches(8.6),
-        Inches(0.58),
+        Inches(8.5),
+        Inches(0.56),
         esc.titulo,
         FONT_DISPLAY,
-        24,
+        25,
         _rgb(pal, pal.ink),
         bold=True,
     )
 
-    # Botón interactivo hacia la ficha de Salud Mental de esta escena
-    _boton(
+    # Botón desencadenador de ventana emergente en la misma diapositiva
+    btn_dato = _boton(
         slide,
-        Inches(9.35),
-        Inches(0.42),
-        Inches(3.43),
-        Inches(0.56),
-        "💡 Dato sobre Salud Mental →",
+        Inches(9.58),
+        Inches(0.45),
+        Inches(3.15),
+        Inches(0.52),
+        "💡 Dato de salud mental",
+        _rgb(pal, pal.accent_soft),
         _rgb(pal, pal.accent),
-        _rgb(pal, pal.accent_ink),
+        _rgb(pal, pal.accent),
         font_size=11,
-        target_slide=slide_dato,
     )
 
-    # Columna izquierda: ilustración + cita + medidores
+    # Columna izquierda: ilustración protagonista y cita breve
     img_path = assets_dir / esc.imagen_archivo
     if img_path.exists():
-        slide.shapes.add_picture(str(img_path), Inches(0.55), Inches(1.28), width=Inches(5.85), height=Inches(3.29))
+        slide.shapes.add_picture(str(img_path), Inches(0.6), Inches(1.32), width=Inches(5.8), height=Inches(3.26))
     else:
-        _rect(slide, Inches(0.55), Inches(1.28), Inches(5.85), Inches(3.29), _rgb(pal, pal.surface), _rgb(pal, pal.border))
+        _rect(slide, Inches(0.6), Inches(1.32), Inches(5.8), Inches(3.26), _rgb(pal, pal.surface), _rgb(pal, pal.border))
 
     cita_box = _rect(
         slide,
-        Inches(0.55),
-        Inches(4.72),
-        Inches(5.85),
-        Inches(1.1),
+        Inches(0.6),
+        Inches(4.82),
+        Inches(5.8),
+        Inches(1.45),
         _rgb(pal, pal.surface),
-        _rgb(pal, pal.accent),
+        _rgb(pal, pal.border),
     )
     tf_c = cita_box.text_frame
-    tf_c.margin_left = Inches(0.18)
-    tf_c.margin_right = Inches(0.18)
+    tf_c.margin_left = Inches(0.24)
+    tf_c.margin_right = Inches(0.24)
     tf_c.vertical_anchor = MSO_ANCHOR.MIDDLE
     pc = tf_c.paragraphs[0]
     rc = pc.add_run()
     rc.text = f"“{esc.cita_destacada}”"
     rc.font.name = FONT_DISPLAY
-    rc.font.size = Pt(11)
+    rc.font.size = Pt(12)
     rc.font.italic = True
     rc.font.color.rgb = _rgb(pal, pal.ink)
 
-    # Medidores visuales Carga Mental vs Calma
-    _texto(
-        slide,
-        Inches(0.55),
-        Inches(5.96),
-        Inches(2.8),
-        Inches(0.24),
-        f"Carga mental: {esc.nivel_carga_mental}%",
-        FONT_BODY,
-        9,
-        _rgb(pal, pal.muted),
-        bold=True,
-    )
-    _rect(slide, Inches(0.55), Inches(6.24), Inches(2.75), Inches(0.14), _rgb(pal, pal.border), shape_type=MSO_SHAPE.RECTANGLE)
-    _rect(
-        slide,
-        Inches(0.55),
-        Inches(6.24),
-        Inches(2.75 * esc.nivel_carga_mental / 100.0),
-        Inches(0.14),
-        _rgb(pal, pal.accent),
-        shape_type=MSO_SHAPE.RECTANGLE,
-    )
-
-    _texto(
-        slide,
-        Inches(3.65),
-        Inches(5.96),
-        Inches(2.75),
-        Inches(0.24),
-        f"Calma interior: {esc.nivel_calma}%",
-        FONT_BODY,
-        9,
-        _rgb(pal, pal.muted),
-        bold=True,
-    )
-    _rect(slide, Inches(3.65), Inches(6.24), Inches(2.75), Inches(0.14), _rgb(pal, pal.border), shape_type=MSO_SHAPE.RECTANGLE)
-    _rect(
-        slide,
-        Inches(3.65),
-        Inches(6.24),
-        Inches(2.75 * esc.nivel_calma / 100.0),
-        Inches(0.14),
-        _rgb(pal, pal.accent),
-        shape_type=MSO_SHAPE.RECTANGLE,
-    )
-
-    # Columna derecha: Relato narrativo completo de la escena
+    # Columna derecha: texto narrativo espacioso y limpio
     tarjeta_texto = _rect(
         slide,
-        Inches(6.68),
-        Inches(1.28),
-        Inches(6.1),
-        Inches(5.26),
+        Inches(6.72),
+        Inches(1.32),
+        Inches(6.0),
+        Inches(4.95),
         _rgb(pal, pal.surface),
         _rgb(pal, pal.border),
+        corner_radius=0.035,
     )
     tf = tarjeta_texto.text_frame
-    tf.margin_left = Inches(0.26)
-    tf.margin_right = Inches(0.26)
-    tf.margin_top = Inches(0.2)
-    tf.margin_bottom = Inches(0.16)
+    tf.vertical_anchor = MSO_ANCHOR.TOP
+    tf.margin_left = Inches(0.32)
+    tf.margin_right = Inches(0.32)
+    tf.margin_top = Inches(0.28)
+    tf.margin_bottom = Inches(0.22)
 
     total_chars = sum(len(p) for p in esc.parrafos)
     size_cuerpo = 11 if total_chars > 950 else 12
 
     for idx_p, parrafo in enumerate(esc.parrafos):
         p = tf.paragraphs[0] if idx_p == 0 else tf.add_paragraph()
-        p.space_after = Pt(10)
+        p.alignment = PP_ALIGN.LEFT
+        p.space_after = Pt(12)
+        p.line_spacing = 1.22
         r = p.add_run()
         r.text = parrafo
         r.font.name = FONT_BODY
         r.font.size = Pt(size_cuerpo)
         r.font.color.rgb = _rgb(pal, pal.ink)
 
-    _barra_navegacion_libro(
+    # Navegación simple abajo: solo Regresar y Siguiente
+    _agregar_navegacion_simple(slide, pal, slide_anterior, slide_siguiente)
+
+    # Ventana emergente compacta sobre el área izquierda (no tapa el texto que estás leyendo)
+    popup_card = _rect(
         slide,
-        pal,
-        slide_portada,
-        slides_escenas,
-        slide_reflexion,
-        slide_infografia,
-        f"esc-{esc.numero}",
+        Inches(0.8),
+        Inches(1.5),
+        Inches(5.4),
+        Inches(3.25),
+        _rgb(pal, pal.surface_alt if pal.es_oscura else pal.surface),
+        _rgb(pal, pal.accent),
+        border_pt=1.75,
+        corner_radius=0.05,
     )
+    tf_p = popup_card.text_frame
+    tf_p.vertical_anchor = MSO_ANCHOR.TOP
+    tf_p.margin_left = Inches(0.26)
+    tf_p.margin_right = Inches(0.55)
+    tf_p.margin_top = Inches(0.22)
+    tf_p.margin_bottom = Inches(0.18)
+
+    p_etq = tf_p.paragraphs[0]
+    p_etq.alignment = PP_ALIGN.LEFT
+    r_etq = p_etq.add_run()
+    r_etq.text = "DATO DE SALUD MENTAL"
+    r_etq.font.name = FONT_BODY
+    r_etq.font.size = Pt(9)
+    r_etq.font.bold = True
+    r_etq.font.color.rgb = _rgb(pal, pal.accent)
+
+    p_tit = tf_p.add_paragraph()
+    p_tit.alignment = PP_ALIGN.LEFT
+    p_tit.space_before = Pt(4)
+    r_tit = p_tit.add_run()
+    r_tit.text = dato.titulo
+    r_tit.font.name = FONT_DISPLAY
+    r_tit.font.size = Pt(16)
+    r_tit.font.bold = True
+    r_tit.font.color.rgb = _rgb(pal, pal.ink)
+
+    p_sub = tf_p.add_paragraph()
+    p_sub.alignment = PP_ALIGN.LEFT
+    p_sub.space_before = Pt(8)
+    r_cif = p_sub.add_run()
+    r_cif.text = f"{dato.cifra_destacada}: " if dato.cifra_destacada.endswith("real") else f"{dato.cifra_destacada} "
+    r_cif.font.name = FONT_BODY
+    r_cif.font.size = Pt(11)
+    r_cif.font.bold = True
+    r_cif.font.color.rgb = _rgb(pal, pal.accent)
+
+    r_sub = p_sub.add_run()
+    r_sub.text = dato.subtitulo_cifra
+    r_sub.font.name = FONT_BODY
+    r_sub.font.size = Pt(11)
+    r_sub.font.bold = True
+    r_sub.font.color.rgb = _rgb(pal, pal.ink)
+
+    p_exp = tf_p.add_paragraph()
+    p_exp.alignment = PP_ALIGN.LEFT
+    p_exp.space_before = Pt(6)
+    r_exp = p_exp.add_run()
+    r_exp.text = dato.explicacion
+    r_exp.font.name = FONT_BODY
+    r_exp.font.size = Pt(11)
+    r_exp.font.color.rgb = _rgb(pal, pal.ink)
+
+    p_acc = tf_p.add_paragraph()
+    p_acc.alignment = PP_ALIGN.LEFT
+    p_acc.space_before = Pt(10)
+    r_acc = p_acc.add_run()
+    r_acc.text = f"Tip: {dato.accion_practica}"
+    r_acc.font.name = FONT_BODY
+    r_acc.font.size = Pt(11)
+    r_acc.font.bold = True
+    r_acc.font.color.rgb = _rgb(pal, pal.accent)
+
+    p_f = tf_p.add_paragraph()
+    p_f.alignment = PP_ALIGN.LEFT
+    p_f.space_before = Pt(8)
+    r_f = p_f.add_run()
+    r_f.text = f"Fuente: {dato.fuente}"
+    r_f.font.name = FONT_BODY
+    r_f.font.size = Pt(9)
+    r_f.font.color.rgb = _rgb(pal, pal.muted)
+
+    btn_cerrar = _boton(
+        slide,
+        Inches(5.72),
+        Inches(1.62),
+        Inches(0.36),
+        Inches(0.36),
+        "✕",
+        _rgb(pal, pal.accent),
+        _rgb(pal, pal.accent_ink),
+        font_size=11,
+    )
+
+    _inyectar_popup_trigger_xml(slide, btn_dato.shape_id, popup_card.shape_id, btn_cerrar.shape_id)
 
     slide.notes_slide.notes_text_frame.text = (
-        f"Escena {esc.numero}: {esc.titulo}\n\n" + "\n\n".join(esc.parrafos)
-    )
-
-
-def _construir_slide_dato_salud(
-    slide,
-    esc: EscenaCuento,
-    slide_portada,
-    slides_escenas: list,
-    slide_escena_origen,
-    slide_reflexion,
-    slide_infografia,
-) -> None:
-    pal = esc.paleta
-    dato = esc.dato_salud
-    _pintar_fondo(slide, pal)
-
-    _rect(
-        slide,
-        Inches(0),
-        Inches(0),
-        Inches(0.2),
-        Inches(6.82),
-        _rgb(pal, pal.accent),
-        shape_type=MSO_SHAPE.RECTANGLE,
-    )
-
-    _boton(
-        slide,
-        Inches(0.6),
-        Inches(0.4),
-        Inches(2.85),
-        Inches(0.46),
-        f"← Volver a Escena 0{esc.numero}",
-        _rgb(pal, pal.surface),
-        _rgb(pal, pal.accent),
-        _rgb(pal, pal.accent),
-        font_size=11,
-        target_slide=slide_escena_origen,
-    )
-
-    _texto(
-        slide,
-        Inches(3.8),
-        Inches(0.48),
-        Inches(8.9),
-        Inches(0.32),
-        f"CÁPSULA DE SALUD MENTAL · VINCULADA A ESCENA 0{esc.numero}",
-        FONT_BODY,
-        10,
-        _rgb(pal, pal.muted),
-        bold=True,
-        align=PP_ALIGN.RIGHT,
-    )
-
-    # Cifra hero izquierda
-    caja_cifra = _rect(
-        slide,
-        Inches(0.6),
-        Inches(1.25),
-        Inches(4.3),
-        Inches(4.95),
-        _rgb(pal, pal.accent_soft),
-        _rgb(pal, pal.accent),
-    )
-    tf_cf = caja_cifra.text_frame
-    tf_cf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    tf_cf.margin_left = Inches(0.28)
-    tf_cf.margin_right = Inches(0.28)
-
-    p1 = tf_cf.paragraphs[0]
-    p1.alignment = PP_ALIGN.CENTER
-    r1 = p1.add_run()
-    r1.text = dato.cifra_destacada
-    r1.font.name = FONT_DISPLAY
-    r1.font.size = Pt(54)
-    r1.font.bold = True
-    r1.font.color.rgb = _rgb(pal, pal.accent)
-
-    p2 = tf_cf.add_paragraph()
-    p2.alignment = PP_ALIGN.CENTER
-    p2.space_before = Pt(14)
-    r2 = p2.add_run()
-    r2.text = dato.subtitulo_cifra
-    r2.font.name = FONT_BODY
-    r2.font.size = Pt(14)
-    r2.font.bold = True
-    r2.font.color.rgb = _rgb(pal, pal.ink)
-
-    # Explicación y acción práctica derecha
-    caja_info = _rect(
-        slide,
-        Inches(5.2),
-        Inches(1.25),
-        Inches(7.55),
-        Inches(4.95),
-        _rgb(pal, pal.surface),
-        _rgb(pal, pal.border),
-    )
-    tf_i = caja_info.text_frame
-    tf_i.margin_left = Inches(0.32)
-    tf_i.margin_right = Inches(0.32)
-    tf_i.margin_top = Inches(0.3)
-
-    pt = tf_i.paragraphs[0]
-    rt = pt.add_run()
-    rt.text = dato.titulo
-    rt.font.name = FONT_DISPLAY
-    rt.font.size = Pt(24)
-    rt.font.bold = True
-    rt.font.color.rgb = _rgb(pal, pal.ink)
-
-    pe = tf_i.add_paragraph()
-    pe.space_before = Pt(16)
-    re = pe.add_run()
-    re.text = dato.explicacion
-    re.font.name = FONT_BODY
-    re.font.size = Pt(14)
-    re.font.color.rgb = _rgb(pal, pal.ink)
-
-    pa_lbl = tf_i.add_paragraph()
-    pa_lbl.space_before = Pt(20)
-    ral = pa_lbl.add_run()
-    ral.text = "ACCIÓN PRÁCTICA DE AUTOCUIDADO"
-    ral.font.name = FONT_BODY
-    ral.font.size = Pt(10)
-    ral.font.bold = True
-    ral.font.color.rgb = _rgb(pal, pal.accent)
-
-    pa = tf_i.add_paragraph()
-    pa.space_before = Pt(6)
-    ra = pa.add_run()
-    ra.text = dato.accion_practica
-    ra.font.name = FONT_BODY
-    ra.font.size = Pt(14)
-    ra.font.bold = True
-    ra.font.color.rgb = _rgb(pal, pal.ink)
-
-    pf = tf_i.add_paragraph()
-    pf.space_before = Pt(22)
-    rf = pf.add_run()
-    rf.text = f"Fuente de referencia: {dato.fuente}"
-    rf.font.name = FONT_BODY
-    rf.font.size = Pt(10)
-    rf.font.color.rgb = _rgb(pal, pal.muted)
-
-    _barra_navegacion_libro(
-        slide, pal, slide_portada, slides_escenas, slide_reflexion, slide_infografia, ""
+        f"{esc.etiqueta_tiempo} — {esc.titulo}\n\n"
+        + "\n\n".join(esc.parrafos)
+        + f"\n\n[Dato de salud mental] {dato.titulo} ({dato.cifra_destacada}): {dato.explicacion}"
     )
 
 
@@ -648,9 +719,8 @@ def _construir_slide_reflexion(
     slide,
     spec: CuentoInfografiaSpec,
     assets_dir: Path,
+    slide_anterior,
     slide_portada,
-    slides_escenas: list,
-    slide_infografia,
 ) -> None:
     pal = spec.escenas[-1].paleta
     _pintar_fondo(slide, pal)
@@ -660,7 +730,7 @@ def _construir_slide_reflexion(
         Inches(0),
         Inches(0),
         SLIDE_W,
-        Inches(0.14),
+        Inches(0.1),
         _rgb(pal, pal.accent),
         shape_type=MSO_SHAPE.RECTANGLE,
     )
@@ -671,7 +741,7 @@ def _construir_slide_reflexion(
         Inches(0.45),
         Inches(12.0),
         Inches(0.32),
-        "EPÍLOGO Y REFLEXIÓN FINAL",
+        "Cierre",
         FONT_BODY,
         11,
         _rgb(pal, pal.accent),
@@ -680,9 +750,9 @@ def _construir_slide_reflexion(
     _texto(
         slide,
         Inches(0.65),
-        Inches(0.8),
+        Inches(0.78),
         Inches(12.0),
-        Inches(0.68),
+        Inches(0.65),
         spec.reflexion_final_titulo,
         FONT_DISPLAY,
         28,
@@ -693,19 +763,23 @@ def _construir_slide_reflexion(
     caja = _rect(
         slide,
         Inches(0.65),
-        Inches(1.68),
-        Inches(7.35),
-        Inches(4.75),
+        Inches(1.65),
+        Inches(7.3),
+        Inches(4.55),
         _rgb(pal, pal.surface),
         _rgb(pal, pal.border),
+        corner_radius=0.035,
     )
     tf = caja.text_frame
-    tf.margin_left = Inches(0.3)
-    tf.margin_right = Inches(0.3)
-    tf.margin_top = Inches(0.28)
+    tf.vertical_anchor = MSO_ANCHOR.TOP
+    tf.margin_left = Inches(0.34)
+    tf.margin_right = Inches(0.34)
+    tf.margin_top = Inches(0.34)
     for idx, par in enumerate(spec.reflexion_final_parrafos):
         p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
-        p.space_after = Pt(14)
+        p.alignment = PP_ALIGN.LEFT
+        p.space_after = Pt(16)
+        p.line_spacing = 1.25
         r = p.add_run()
         r.text = par
         r.font.name = FONT_BODY
@@ -714,196 +788,41 @@ def _construir_slide_reflexion(
 
     img_calma = assets_dir / spec.escenas[-1].imagen_archivo
     if img_calma.exists():
-        slide.shapes.add_picture(str(img_calma), Inches(8.28), Inches(1.68), width=Inches(4.48), height=Inches(2.52))
+        slide.shapes.add_picture(str(img_calma), Inches(8.28), Inches(1.65), width=Inches(4.45), height=Inches(2.5))
 
-    _boton(
+    _agregar_navegacion_simple(
         slide,
-        Inches(8.28),
-        Inches(4.5),
-        Inches(4.48),
-        Inches(0.66),
-        "Ver Infografía & 5 Claves →",
-        _rgb(pal, pal.accent),
-        _rgb(pal, pal.accent_ink),
-        font_size=13,
-        target_slide=slide_infografia,
+        pal,
+        slide_anterior=slide_anterior,
+        slide_siguiente=slide_portada,
+        texto_anterior="← Regresar",
+        texto_siguiente="Volver al inicio",
     )
 
-    _texto(
-        slide,
-        Inches(8.28),
-        Inches(5.36),
-        Inches(4.48),
-        Inches(0.9),
-        f"Relato completo: {spec.total_palabras_relato()} palabras.\nCada escena incluye su cápsula interactiva de salud mental.",
-        FONT_BODY,
-        11,
-        _rgb(pal, pal.muted),
-    )
-
-    _barra_navegacion_libro(
-        slide, pal, slide_portada, slides_escenas, slide, slide_infografia, "reflexion"
-    )
-
-
-def _construir_slide_infografia(
-    slide,
-    spec: CuentoInfografiaSpec,
-    slide_portada,
-    slides_escenas: list,
-    slide_reflexion,
-) -> None:
-    pal = spec.escenas[-1].paleta
-    _pintar_fondo(slide, pal)
-
-    _texto(
-        slide,
-        Inches(0.55),
-        Inches(0.32),
-        Inches(12.2),
-        Inches(0.52),
-        "Infografía de Cierre: De la Sobrecarga Fría a la Claridad Cálida",
-        FONT_DISPLAY,
-        22,
-        _rgb(pal, pal.ink),
-        bold=True,
-    )
-    _texto(
-        slide,
-        Inches(0.55),
-        Inches(0.84),
-        Inches(12.2),
-        Inches(0.36),
-        "Evolución emocional de Elena a lo largo de las 5 escenas y claves prácticas para cuidar la salud mental.",
-        FONT_BODY,
-        11,
-        _rgb(pal, pal.muted),
-    )
-
-    # Gráfico nativo editable: Carga mental vs Calma interior
-    chart_data = CategoryChartData()
-    chart_data.categories = [f"Escena {e.numero}" for e in spec.escenas]
-    chart_data.add_series("Carga mental (%)", tuple(e.nivel_carga_mental for e in spec.escenas))
-    chart_data.add_series("Calma interior (%)", tuple(e.nivel_calma for e in spec.escenas))
-
-    chart_shape = slide.shapes.add_chart(
-        XL_CHART_TYPE.LINE_MARKERS,
-        Inches(0.55),
-        Inches(1.38),
-        Inches(6.95),
-        Inches(5.12),
-        chart_data,
-    )
-    chart = chart_shape.chart
-    chart.has_legend = True
-    chart.series[0].format.line.color.rgb = RGBColor(0x47, 0x55, 0x69)
-    chart.series[0].format.line.width = Pt(2.75)
-    chart.series[1].format.line.color.rgb = _rgb(pal, pal.accent)
-    chart.series[1].format.line.width = Pt(3.25)
-
-    # Panel derecho: 5 claves para cerrar pestañas
-    panel = _rect(
-        slide,
-        Inches(7.78),
-        Inches(1.38),
-        Inches(5.0),
-        Inches(5.12),
-        _rgb(pal, pal.surface),
-        _rgb(pal, pal.border),
-    )
-    tf = panel.text_frame
-    tf.margin_left = Inches(0.24)
-    tf.margin_right = Inches(0.24)
-    tf.margin_top = Inches(0.22)
-
-    p0 = tf.paragraphs[0]
-    r0 = p0.add_run()
-    r0.text = "5 Claves para Cerrar Pestañas"
-    r0.font.name = FONT_DISPLAY
-    r0.font.size = Pt(16)
-    r0.font.bold = True
-    r0.font.color.rgb = _rgb(pal, pal.accent)
-
-    for idx, clave in enumerate(spec.claves_autocuidado, start=1):
-        p = tf.add_paragraph()
-        p.space_before = Pt(11)
-        rn = p.add_run()
-        rn.text = f"0{idx}.  "
-        rn.font.name = FONT_BODY
-        rn.font.size = Pt(11)
-        rn.font.bold = True
-        rn.font.color.rgb = _rgb(pal, pal.accent)
-
-        rc = p.add_run()
-        rc.text = clave
-        rc.font.name = FONT_BODY
-        rc.font.size = Pt(11)
-        rc.font.color.rgb = _rgb(pal, pal.ink)
-
-    _barra_navegacion_libro(
-        slide, pal, slide_portada, slides_escenas, slide_reflexion, slide, "infografia"
+    slide.notes_slide.notes_text_frame.text = (
+        f"{spec.reflexion_final_titulo}\n\n" + "\n\n".join(spec.reflexion_final_parrafos)
     )
 
 
 def exportar_cuento_pptx_bytes(spec: CuentoInfografiaSpec, assets_dir: Path) -> bytes:
-    """Genera el archivo PowerPoint interactivo e ilustrado (.pptx) en memoria."""
+    """Genera un PowerPoint limpio de 7 diapositivas (Portada + 5 páginas con popup nativo + Reflexión)."""
     prs = Presentation()
     prs.slide_width = SLIDE_W
     prs.slide_height = SLIDE_H
     blank = prs.slide_layouts[6]
 
-    # Fase 1: crear todas las diapositivas destino para cablear enlaces target_slide
     slide_portada = prs.slides.add_slide(blank)
-    slides_escenas = [prs.slides.add_slide(blank) for _ in spec.escenas]
+    slides_paginas = [prs.slides.add_slide(blank) for _ in spec.escenas]
     slide_reflexion = prs.slides.add_slide(blank)
-    slide_infografia = prs.slides.add_slide(blank)
-    slides_datos = [prs.slides.add_slide(blank) for _ in spec.escenas]
 
-    # Fase 2: poblar diapositivas con transición frío -> cálido e interactividad
-    _construir_portada(
-        slide_portada, spec, assets_dir, slides_escenas, slide_reflexion, slide_infografia
-    )
+    _construir_portada(slide_portada, spec, assets_dir, slides_paginas[0])
 
     for idx, esc in enumerate(spec.escenas):
-        _construir_slide_escena(
-            slides_escenas[idx],
-            esc,
-            spec,
-            assets_dir,
-            slide_portada,
-            slides_escenas,
-            slides_datos[idx],
-            slide_reflexion,
-            slide_infografia,
-        )
+        anterior = slide_portada if idx == 0 else slides_paginas[idx - 1]
+        siguiente = slides_paginas[idx + 1] if idx + 1 < len(spec.escenas) else slide_reflexion
+        _construir_slide_pagina(slides_paginas[idx], esc, assets_dir, anterior, siguiente)
 
-    _construir_slide_reflexion(
-        slide_reflexion,
-        spec,
-        assets_dir,
-        slide_portada,
-        slides_escenas,
-        slide_infografia,
-    )
-
-    _construir_slide_infografia(
-        slide_infografia,
-        spec,
-        slide_portada,
-        slides_escenas,
-        slide_reflexion,
-    )
-
-    for idx, esc in enumerate(spec.escenas):
-        _construir_slide_dato_salud(
-            slides_datos[idx],
-            esc,
-            slide_portada,
-            slides_escenas,
-            slides_escenas[idx],
-            slide_reflexion,
-            slide_infografia,
-        )
+    _construir_slide_reflexion(slide_reflexion, spec, assets_dir, slides_paginas[-1], slide_portada)
 
     buf = io.BytesIO()
     prs.save(buf)
